@@ -10,7 +10,7 @@ import (
 
 func TradePairService() {
 	r := gin.Default()
-	r.POST("/qilin/getTradePair", func(c *gin.Context) {
+	r.POST("/getTradePair", func(c *gin.Context) {
 		buf := make([]byte, 1024)
 		n, _ := c.Request.Body.Read(buf)
 		a := qilin_request.Condition{}

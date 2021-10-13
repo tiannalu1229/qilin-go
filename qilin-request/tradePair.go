@@ -34,6 +34,7 @@ type TradePair struct {
 	Price       string `json:"price"`
 	Tvl         string `json:"tvl"`
 	Volume24h   string `json:"volume_24h"`
+	PoolDecimal string `json:"pool_decimal"`
 }
 
 func SelectTradePair(keyword string, page int, size int) Result {
@@ -55,10 +56,65 @@ func SelectTradePair(keyword string, page int, size int) Result {
 	db.SetMaxIdleConns(1000)
 
 	//select total
-	num, err := db.Query("SELECT count(*) FROM t_pools where pool_symbol = '" +
-		keyword + "' or trade_symbol = '" +
-		keyword + "' or pool_address = '" +
-		keyword + "'")
+	totalSql := "SELECT count(*) FROM t_pools"
+
+	maxHeightSql := "select (to_number(max(block_height), '99999999999') - 5760) block_height from t_settings"
+
+	maxHeightRows, err := db.Query(maxHeightSql)
+
+	var blockHeight string
+	for maxHeightRows.Next() {
+		if err = maxHeightRows.Scan(&blockHeight); err != nil {
+			log.Fatal("PG Rows Scan Failed: ", err)
+		}
+	}
+
+	poolSql := "select tvl.pool_address, tvl.trade_pair, tvl.pool_symbol, tvl.fee, ttpc.price, tvl.tvl, v24.sum_size_24h, tvl.pool_decimal from (SELECT t_pools.trade_pair, " +
+		"t_pools.fee, t_pools.pool_symbol, t_pools.pool_decimal, t_pools.trade_symbol, " +
+		"(to_number(t_pools.funded_liquidity, '99999999999999999999999999999999999999.9999999999999999999') + coalesce(positions.sum_margin, 0)) as tvl, " +
+		"t_pools.pool_address " +
+		"FROM t_pools " +
+		"left join " +
+		"(select sum(to_number(margin, '99999999999999999999999999999999999999.9999999999999999999')) as sum_margin, pool_address " +
+		"from t_positions " +
+		"group by pool_address) as positions on t_pools.pool_address = positions.pool_address) tvl " +
+		"left join (select t_pools.pool_address, t_pools.trade_pair, " +
+		"coalesce(sum(case when position('Inverse' in t_pools.trade_pair) > 0 " +
+		"then to_number(size, '99999999999999999999999999999999999999.9999999999999999999') * to_number(open_price, '99999999999999999999999999999999999999.9999999999999999999') / 1000000000000000000.000000000000000000000 " +
+		"else to_number(size, '99999999999999999999999999999999999999.9999999999999999999') end), 0) as sum_size_24h " +
+		"from t_positions " +
+		"right join t_pools " +
+		"on t_pools.pool_address = t_positions.pool_address " +
+		"and ((close_block_height = 0 and " +
+		"open_block_height >= (select max(block_height) from t_trade_token_price_change) - (24 * 3600 / 10)) " +
+		"or close_block_height >= (select max(block_height) from t_trade_token_price_change) - (24 * 3600 / 10)) " +
+		"group by t_pools.pool_address, t_pools.trade_pair " +
+		"order by t_pools.trade_pair) v24 on tvl.pool_address = v24.pool_address " +
+		"left join " +
+		"(select tt.pool_address, tt.price " +
+		"from (select pool_address, max(block_height) block_height " +
+		"from t_trade_token_price_change " +
+		"group by pool_address) tmp " +
+		"left join t_trade_token_price_change tt " +
+		"on tt.pool_address = tmp.pool_address " +
+		"and tt.block_height = tmp.block_height) ttpc " +
+		"on tvl.pool_address = ttpc.pool_address"
+
+	if keyword != "" {
+		totalSql = totalSql + " where pool_symbol = '" +
+			keyword + "' or trade_symbol = '" +
+			keyword + "' or pool_address = '" +
+			keyword + "'"
+
+		poolSql = poolSql + " where tvl.pool_symbol = '" +
+			keyword + "' or trade_symbol = '" +
+			keyword + "' or tvl.pool_address = '" +
+			keyword + "' order by tvl desc limit " + strconv.Itoa(size) + " offset " + strconv.Itoa(page*size)
+	} else {
+		poolSql = poolSql + " order by tvl desc limit " + strconv.Itoa(size) + " offset " + strconv.Itoa(page*size)
+	}
+
+	num, err := db.Query(totalSql)
 
 	var count int
 	for num.Next() {
@@ -68,41 +124,7 @@ func SelectTradePair(keyword string, page int, size int) Result {
 		fmt.Println(count)
 	}
 
-	rows, err := db.Query("SELECT pl.trade_pair, " +
-		"pl.fee, " +
-		"to_number(pl.liquidity_pool,'9999999999999999999') + to_number(pl.total_size_short, '9999999999999999999') + to_number(pl.total_size_long, '9999999999999999999') tvl, " +
-		"COALESCE(pos.size, 0) * to_number(ttp.price, '99999999999999999') volume24h, " +
-		"ttp.price price, " +
-		"pl.pool_symbol, " +
-		"pl.pool_address " +
-		"FROM t_pools pl left join " +
-		"(select a.pool_address, (COALESCE(a.size, 0) + COALESCE(b.size, 0)) size from " +
-		"(select pool_address, COALESCE(sum(to_number(size, '9999999999999999999')), 0) size from t_positions " +
-		"where " +
-		"(open_block_height >= (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760) " +
-		"and close_block_height < (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760)) " +
-		"or (open_block_height < (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760) " +
-		"and close_block_height >= (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760)) " +
-		"group by pool_address " +
-		") a left join " +
-		"(select pool_address, COALESCE(sum(to_number(size, '9999999999999999999')), 0) * 2 size from t_positions " +
-		"where " +
-		"(open_block_height >= (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760) " +
-		"and close_block_height >= (select to_number((select max(block_height) block_height from t_settings), '99999999999') - 5760)) " +
-		"group by pool_address " +
-		") b " +
-		"on a.pool_address = b.pool_address) pos " +
-		"on pos.pool_address = pl.pool_address " +
-		"left join " +
-		"(select ttpc.pool_address, ttpc.price from (select pool_address, max(block_height) block_height from t_trade_token_price_change group by pool_address) pb " +
-		"left join t_trade_token_price_change ttpc " +
-		"on ttpc.pool_address = pb.pool_address " +
-		"and ttpc.block_height = pb.block_height) ttp " +
-		"on pl.pool_address = ttp.pool_address " +
-		"where pl.pool_symbol = '" +
-		keyword + "' or pl.trade_symbol = '" +
-		keyword + "' or pl.pool_address = '" +
-		keyword + "' order by tvl desc limit " + strconv.Itoa(size) + " offset " + strconv.Itoa(page))
+	rows, err := db.Query(poolSql)
 
 	if err != nil {
 		log.Fatal("PG Statements Wrong: ", err)
@@ -122,13 +144,14 @@ func SelectTradePair(keyword string, page int, size int) Result {
 
 		var tradePair string
 		var fee string
+		var price string
 		var tvl string
 		var volume24h string
-		var price string
 		var poolSymbol string
 		var poolAddress string
+		var poolDecimal string
 
-		if err := rows.Scan(&tradePair, &fee, &tvl, &volume24h, &price, &poolSymbol, &poolAddress); err != nil {
+		if err := rows.Scan(&poolAddress, &tradePair, &poolSymbol, &fee, &price, &tvl, &volume24h, &poolDecimal); err != nil {
 			log.Fatal("PG Rows Scan Failed: ", err)
 		}
 
@@ -140,6 +163,7 @@ func SelectTradePair(keyword string, page int, size int) Result {
 			Price:       price,
 			Tvl:         tvl,
 			Volume24h:   volume24h,
+			PoolDecimal: poolDecimal,
 		}
 		pairs = append(pairs, pair)
 
